@@ -188,23 +188,32 @@ def get_news_data(ticker):
 
 @st.cache_data(ttl=3600)
 def get_fundamental_data(ticker):
-    """Busca dados fundamentalistas"""
+    """Busca dados fundamentalistas com validação rigorosa"""
     try:
         acao = yf.Ticker(ticker)
         info = acao.get_info()
         
+        # Validação inicial mais rigorosa
         if not info or len(info) < 5:
             return None
         
+        # Verificar se tem dados essenciais
         market_cap = info.get('marketCap', 0)
+        if not market_cap or market_cap <= 0:
+            return None
+        
         pe_ratio = info.get('forwardPE') or info.get('trailingPE')
         pb_ratio = info.get('priceToBook')
         div_yield = info.get('dividendYield', 0) * 100 if info.get('dividendYield') else 0
         
-        # ROE
+        # ROE com validação
+        roe_medio = np.nan
         try:
             dre = acao.financials.T
             balanco = acao.balance_sheet.T
+            
+            if dre.empty or balanco.empty:
+                return None
             
             roe_values = []
             for idx in range(min(3, len(dre))):
@@ -214,20 +223,28 @@ def get_fundamental_data(ticker):
                     
                     if pd.notna(lucro) and pd.notna(pl) and pl != 0:
                         roe = (lucro / pl) * 100
-                        roe_values.append(roe)
+                        # Validar se ROE está em range razoável
+                        if -100 < roe < 500:  # Limites de sanidade
+                            roe_values.append(roe)
                 except:
                     pass
             
-            roe_medio = np.mean(roe_values) if roe_values else np.nan
+            if roe_values:
+                roe_medio = np.mean(roe_values)
+            else:
+                return None  # Sem ROE válido, não incluir
         except:
-            roe_medio = np.nan
+            return None
         
-        # Classificação
+        # Classificação baseada em ROE real
         status = "🔴 Fraco"
-        score = 0
+        score = 40
         
         if pd.notna(roe_medio):
-            if roe_medio >= 20:
+            if roe_medio >= 30:
+                status = "🟢 Excelente"
+                score = 95
+            elif roe_medio >= 20:
                 status = "🟢 Excelente"
                 score = 85
             elif roe_medio >= 15:
@@ -237,21 +254,30 @@ def get_fundamental_data(ticker):
                 status = "🟠 Atenção"
                 score = 55
             else:
+                status = "🔴 Fraco"
                 score = 40
+        
+        # Bônus por dividendos
+        if div_yield > 4:
+            score += 5
+        
+        # Penalidade por P/E muito alto
+        if pd.notna(pe_ratio) and pe_ratio > 50:
+            score -= 5
         
         return {
             'ticker': ticker,
             'market_cap': market_cap / 1e9 if market_cap else 0,
-            'pe': pe_ratio,
-            'pb': pb_ratio,
+            'pe': pe_ratio if pd.notna(pe_ratio) else np.nan,
+            'pb': pb_ratio if pd.notna(pb_ratio) else np.nan,
             'div_yield': div_yield,
             'roe': roe_medio,
             'status': status,
-            'score': score,
+            'score': max(0, min(100, score)),  # Entre 0 e 100
             'setor': info.get('sector', 'N/A'),
             'price': info.get('currentPrice', 0)
         }
-    except:
+    except Exception as e:
         return None
 
 @st.cache_data(ttl=3600)
@@ -608,14 +634,69 @@ elif analysis_type == "📊 Dashboard Completo":
     
     for i, ticker in enumerate(selected_tickers[:news_limit]):
         news = get_news_data(ticker)
+        
         if news:
-            news_opps.append({
-                'ticker': ticker,
-                'bdr': TICKER_MAPPING.get(ticker, f"{ticker}34"),
-                'score': 85,
-                'events': ['Earnings próximo']
-            })
-        time.sleep(0.05)
+            # Análise REAL dos dados
+            try:
+                stock = yf.Ticker(ticker)
+                info = stock.info
+                
+                score = 50  # Base score
+                events = []
+                priority = "🟡 Média"
+                
+                # Verificar earnings
+                try:
+                    calendar = stock.calendar
+                    if calendar is not None and 'Earnings Date' in calendar:
+                        earnings_date = calendar['Earnings Date']
+                        if isinstance(earnings_date, list) and len(earnings_date) > 0:
+                            date_obj = earnings_date[0]
+                            days_until = (datetime(date_obj.year, date_obj.month, date_obj.day) - datetime.now()).days
+                            
+                            if 0 < days_until <= 3:
+                                score += 40
+                                events.append(f"⚡ Earnings em {days_until} dias")
+                                priority = "🔴 Urgente"
+                            elif days_until <= 7:
+                                score += 30
+                                events.append(f"Earnings em {days_until} dias")
+                                priority = "🔴 Urgente"
+                            elif days_until <= 14:
+                                score += 20
+                                events.append(f"Earnings em {days_until} dias")
+                                priority = "🟠 Alta"
+                            else:
+                                events.append(f"Earnings em {days_until} dias")
+                except:
+                    pass
+                
+                # Verificar dividendos
+                if info.get('dividendYield') and info.get('dividendYield') > 0:
+                    div_yield = info.get('dividendYield') * 100
+                    score += 15
+                    events.append(f"Div Yield: {div_yield:.2f}%")
+                
+                # Contabilizar número de notícias
+                news_count = len(news)
+                if news_count > 5:
+                    score += 10
+                    events.append(f"{news_count} notícias recentes")
+                
+                # Só adicionar se tiver eventos relevantes
+                if events or score > 60:
+                    news_opps.append({
+                        'ticker': ticker,
+                        'bdr': TICKER_MAPPING.get(ticker, f"{ticker}34"),
+                        'score': score,
+                        'priority': priority,
+                        'events': ', '.join(events) if events else 'Notícias recentes',
+                        'news_count': news_count
+                    })
+            except:
+                pass
+        
+        time.sleep(0.1)
         progress_bar.progress(10 + int((i / news_limit) * 30))
     
     # Análise Fundamentalista
@@ -625,8 +706,15 @@ elif analysis_type == "📊 Dashboard Completo":
     fund_data = []
     fund_limit = min(100, len(selected_tickers))
     
+    # Contadores para debug
+    total_tentativas = 0
+    sem_dados = 0
+    filtrados = 0
+    
     for i, ticker in enumerate(selected_tickers[:fund_limit]):
+        total_tentativas += 1
         data = get_fundamental_data(ticker)
+        
         if data:
             # Aplicar filtros
             if (roe_range[0] <= data.get('roe', 0) <= roe_range[1] and
@@ -634,8 +722,22 @@ elif analysis_type == "📊 Dashboard Completo":
                 data.get('div_yield', 0) >= div_yield_min and
                 data.get('market_cap', 0) >= market_cap_min):
                 fund_data.append(data)
+            else:
+                filtrados += 1
+        else:
+            sem_dados += 1
+        
         time.sleep(0.03)
         progress_bar.progress(45 + int((i / fund_limit) * 40))
+    
+    # Mostrar estatísticas de debug
+    if total_tentativas > 0:
+        with st.expander("ℹ️ Estatísticas de Análise"):
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Tentativas", total_tentativas)
+            col2.metric("Com Dados", total_tentativas - sem_dados)
+            col3.metric("Filtrados", filtrados)
+            col4.metric("Final", len(fund_data))
     
     # Polymarket
     status_text.text("🎯 Consultando Polymarket...")
@@ -776,7 +878,38 @@ elif analysis_type == "📊 Dashboard Completo":
         
         if news_opps:
             df_news = pd.DataFrame(news_opps)
-            st.dataframe(df_news, use_container_width=True, hide_index=True)
+            
+            # Ordenar por score
+            df_news = df_news.sort_values('score', ascending=False)
+            
+            # Estatísticas
+            col1, col2, col3 = st.columns(3)
+            
+            if 'priority' in df_news.columns:
+                urgentes = len(df_news[df_news['priority'] == '🔴 Urgente'])
+                altas = len(df_news[df_news['priority'] == '🟠 Alta'])
+                medias = len(df_news[df_news['priority'] == '🟡 Média'])
+                
+                col1.metric("🔴 Urgentes", urgentes)
+                col2.metric("🟠 Altas", altas)
+                col3.metric("🟡 Médias", medias)
+            
+            st.markdown("<br>", unsafe_allow_html=True)
+            
+            # Tabela
+            st.dataframe(
+                df_news,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "score": st.column_config.ProgressColumn(
+                        "Score",
+                        format="%d",
+                        min_value=0,
+                        max_value=100,
+                    ),
+                }
+            )
         else:
             st.info("📭 Nenhuma notícia relevante")
     
